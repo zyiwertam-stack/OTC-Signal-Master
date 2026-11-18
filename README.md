@@ -5,13 +5,13 @@ Native Android chart scanner. Screen capture and analysis run locally; the app d
 ## Local analysis
 
 - **OpenCV 4.12.0** (Apache-2.0): HSV colour segmentation, vertical morphological cleanup, connected-component candle extraction, approximate body/wick geometry, local extrema, and visual pattern heuristics.
-- **Google ML Kit Text Recognition 16.0.1**, bundled Latin model: on-device OCR of visible chart text and numeric labels. The bundled model avoids a first-run model download.
-- **OpenCV Lucas–Kanade Optical Flow**: estimates vertical image movement between the first and last video samples.
-- **Technical heuristics**: recent candle-position trend, red/green candle vote, visible-range location, and optional optical-flow evidence are combined. CALL/PUT require agreeing evidence; weak, missing, or conflicting evidence returns WAIT. The displayed score is a heuristic evidence score, not a calibrated probability.
+- **Google ML Kit Text Recognition 16.0.1**, bundled Latin model: on-device OCR searches dynamically detected blue price-label regions, records readings with frame timestamps, and continues when individual frames are unreadable.
+- **OpenCV Lucas–Kanade Optical Flow**: estimates vertical image movement between each adjacent pair of video samples.
+- **Technical heuristics**: candle position and body direction, streaks and alternation, body-size changes, wick-based reversal evidence, price change and velocity, frame-to-frame trend, and optical flow contribute to one weighted direction score. A successful directional analysis returns CALL or PUT; weak evidence is marked `LOW DATA QUALITY`. The displayed score is an internal heuristic, not a calibrated probability.
 
-The app samples up to seven chronologically ordered frames from a 3.5-second screen recording. Candle detection runs on every sampled frame; the newest frame supplies candle geometry and earlier/later samples provide temporal price-position and optical-flow evidence. It also supports screenshot capture and manual image selection. Images are not uploaded. Capture size/stride, per-frame red/green pixel and candle counts, temporal evidence, and final status are written to Android logs (`OTCScanCapture` and `OTCScanAnalysis`).
+VIDEO SCAN records for 10 seconds and samples up to 10 chronologically ordered frames across the recording. Candle and blue-price-region detection run on every frame; OCR price samples include timestamps, and movement, speed, and acceleration are evaluated across readable samples. SCREENSHOT analyzes one captured frame. GET SIGNAL reuses a recent result's frames or requests a fresh screenshot if the cached capture is missing or older than 30 seconds. Image analysis runs on a worker thread; images are not uploaded. Capture size, per-frame red/green pixel and candle counts, price OCR coverage, temporal evidence, and final status are written to Android logs (`OTCScanCapture` and `OTCScanAnalysis`).
 
-Technical outcomes are distinguished from completed analysis: capture and analysis errors, missing chart colors, and missing candle components display ERROR rather than WAIT 0%; insufficient candle history is identified separately from a completed WAIT. A completed WAIT can have nonzero heuristic evidence strength; this percentage is not a calibrated probability or expected return. The project currently implements one on-device analysis pipeline rather than eight separate engines.
+Technical outcomes are distinguished from completed analysis: capture failures, missing chart evidence, and images without measurable directional evidence display ERROR. A completed analysis with little history or low OCR coverage still reports the stronger of its measured CALL/PUT evidence and warns `LOW DATA QUALITY`. Confidence reflects score strength, evidence agreement, recognized candles and frames, price OCR coverage, and reversal penalties; it is not a probability of profit. The project implements one on-device pipeline with shared evidence rather than separate or simulated engines.
 
 ### Models and licensing limits
 
@@ -34,6 +34,6 @@ GitHub Actions runs the same build and lint tasks and publishes the debug APK as
 
 1. Install the APK and allow display over other apps.
 2. Start the floating panel and grant screen-capture consent through Android's system prompt.
-3. Open the chart and use **SCREENSHOT**, **VIDEO SCAN**, and **GET SIGNAL**.
+3. Open the chart and use **SCREENSHOT**, **VIDEO SCAN**, and **GET SIGNAL**. VIDEO SCAN takes 10 seconds; the floating panel is restored when capture completes.
 
-Screen capture requires explicit user consent. Android may revoke consent when a capture session ends; secure/DRM-protected windows can appear blank. The app does not place trades, access trading accounts, or guarantee that visual signals are accurate or profitable. Red/green colour-based detection can return WAIT on charts with other colour schemes or clutter.
+Screen capture requires explicit user consent. Android may revoke consent when a capture session ends; secure/DRM-protected windows can appear blank. The app does not place trades, access trading accounts, or guarantee that visual signals are accurate or profitable. Candle color detection depends on chart colors and may provide a low-quality preliminary signal on other color schemes or cluttered charts.

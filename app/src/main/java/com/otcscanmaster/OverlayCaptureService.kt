@@ -61,6 +61,8 @@ class OverlayCaptureService : Service() {
     private var densityDpi = 0
     @Volatile private var captureMode = CaptureMode.IDLE
     @Volatile private var lastFrames: List<Bitmap> = emptyList()
+    @Volatile private var lastFrameTimestampsMs: List<Long> = emptyList()
+    @Volatile private var lastCaptureAtMs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -295,11 +297,12 @@ class OverlayCaptureService : Service() {
 
     private fun completeScreenshot(bitmap: Bitmap) {
         captureMode = CaptureMode.IDLE
-        replaceLastFrames(listOf(bitmap))
+        val timestamp = System.currentTimeMillis()
+        replaceLastFrames(listOf(bitmap), listOf(timestamp))
         mainHandler.post { setOverlayVisible(true) }
         Log.i(TAG, "screenshot received size=${bitmap.width}x${bitmap.height}; overlay restoration requested")
         publishStatus("Скриншот ${bitmap.width}x${bitmap.height} получен; анализирую на устройстве…")
-        runAnalysis(listOf(bitmap))
+        runAnalysis(listOf(bitmap), listOf(timestamp))
     }
 
     private fun scanVideo() {
@@ -309,7 +312,7 @@ class OverlayCaptureService : Service() {
             return
         }
         setOverlayVisible(false)
-        publishStatus("Подготовка короткого сканирования…")
+        publishStatus("Подготовка 10-секундного сканирования…")
         mainHandler.postDelayed({
             if (destroyed) return@postDelayed
             worker.execute {
@@ -342,7 +345,7 @@ class OverlayCaptureService : Service() {
                                 "video recording started size=${prepared.width}x${prepared.height} " +
                                     "durationMs=$VIDEO_DURATION_MS"
                             )
-                            publishStatus("Запись экрана (3,5 секунды)…")
+                            publishStatus("Запись экрана (10 секунд)…")
                             mainHandler.postDelayed({
                                 if (destroyed) return@postDelayed
                                 captureMode = CaptureMode.IDLE
@@ -427,14 +430,18 @@ class OverlayCaptureService : Service() {
                 return@execute
             }
             try {
-                val frames = extractVideoFrames(file)
-                if (frames.isEmpty()) {
+                val extracted = extractVideoFrames(file)
+                if (extracted.bitmaps.isEmpty()) {
                     publishTechnicalError("Не удалось извлечь кадры из видеозаписи.")
                 } else {
-                    replaceLastFrames(frames)
-                    Log.i(TAG, "video extracted frames=${frames.size} first=${frames.first().width}x${frames.first().height}")
-                    publishStatus("Извлечено ${frames.size} последовательных кадров; анализирую на устройстве…")
-                    runAnalysis(frames)
+                    replaceLastFrames(extracted.bitmaps, extracted.timestampsMs)
+                    Log.i(
+                        TAG,
+                        "video extracted frames=${extracted.bitmaps.size} " +
+                            "first=${extracted.bitmaps.first().width}x${extracted.bitmaps.first().height}"
+                    )
+                    publishStatus("Извлечено ${extracted.bitmaps.size} последовательных кадров; анализирую на устройстве…")
+                    runAnalysis(extracted.bitmaps, extracted.timestampsMs)
                 }
             } catch (exception: Exception) {
                 publishTechnicalError("Ошибка обработки видео: ${exception.message ?: "не удалось извлечь кадры"}")
@@ -444,14 +451,19 @@ class OverlayCaptureService : Service() {
         }
     }
 
-    private fun extractVideoFrames(file: File): List<Bitmap> {
+    private fun extractVideoFrames(file: File): ExtractedFrames {
         val retriever = MediaMetadataRetriever()
         val frames = mutableListOf<Bitmap>()
+        val timestampsMs = mutableListOf<Long>()
         try {
             retriever.setDataSource(file.absolutePath)
             val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: VIDEO_DURATION_MS
-            val frameCount = minOf(MAX_VIDEO_FRAMES, (durationMs / VIDEO_SAMPLE_INTERVAL_MS).toInt())
+            val recordingStartMs = System.currentTimeMillis() - durationMs
+            val frameCount = minOf(
+                MAX_VIDEO_FRAMES,
+                ((durationMs + VIDEO_SAMPLE_INTERVAL_MS - 1) / VIDEO_SAMPLE_INTERVAL_MS).toInt()
+            )
             for (index in 0 until frameCount) {
                 val timestampUs = (index * VIDEO_SAMPLE_INTERVAL_MS + 100L)
                     .coerceAtMost((durationMs - 1).coerceAtLeast(0L)) * 1_000L
@@ -460,6 +472,7 @@ class OverlayCaptureService : Service() {
                     MediaMetadataRetriever.OPTION_CLOSEST
                 ) ?: continue
                 frames.add(reduceForAnalysis(frame))
+                timestampsMs.add(recordingStartMs + timestampUs / 1_000L)
                 Log.d(TAG, "video sample index=${frames.lastIndex + 1} timestampMs=${timestampUs / 1_000}")
             }
         } catch (exception: Exception) {
@@ -468,7 +481,7 @@ class OverlayCaptureService : Service() {
         } finally {
             retriever.release()
         }
-        return frames
+        return ExtractedFrames(frames, timestampsMs)
     }
 
     private fun releaseRecorder(recorder: MediaRecorder) {
@@ -485,13 +498,14 @@ class OverlayCaptureService : Service() {
             showMessage("Анализ уже выполняется.")
             return
         }
+        val frames = lastFrames
+        val timestamps = lastFrameTimestampsMs
+        if (frames.isEmpty() || System.currentTimeMillis() - lastCaptureAtMs > MAX_SIGNAL_AGE_MS) {
+            if (ensureProjection()) takeScreenshot()
+            return
+        }
         worker.execute {
-            val frames = lastFrames
-            if (frames.isEmpty()) {
-                publishResult(SignalResult.insufficient("Сначала создайте скриншот или выполните VIDEO SCAN."))
-            } else {
-                runAnalysis(frames)
-            }
+            runAnalysis(frames, timestamps)
         }
     }
 
@@ -521,8 +535,9 @@ class OverlayCaptureService : Service() {
                     android.graphics.BitmapFactory.decodeStream(input, null, options)
                         ?: throw IllegalArgumentException("Файл не является читаемым изображением.")
                 }
-                replaceLastFrames(listOf(bitmap))
-                runAnalysis(listOf(bitmap))
+                val timestamp = System.currentTimeMillis()
+                replaceLastFrames(listOf(bitmap), listOf(timestamp))
+                runAnalysis(listOf(bitmap), listOf(timestamp))
             } catch (exception: Exception) {
                 publishResult(
                     SignalResult.technicalFailure(
@@ -534,11 +549,11 @@ class OverlayCaptureService : Service() {
         }
     }
 
-    private fun runAnalysis(frames: List<Bitmap>) {
+    private fun runAnalysis(frames: List<Bitmap>, timestampsMs: List<Long>) {
         analysisActive = true
         publishStatus("${SignalResult.STATUS_ANALYZING.uppercase()}: локальный анализ ${frames.size} кадр(ов)…")
         try {
-            val result = OnDeviceAnalysisEngine().analyze(frames)
+            val result = OnDeviceAnalysisEngine().analyze(frames, timestampsMs)
             publishResult(result)
         } catch (exception: Exception) {
             Log.e(TAG, "local analysis failed frames=${frames.size}", exception)
@@ -553,9 +568,12 @@ class OverlayCaptureService : Service() {
         }
     }
 
-    private fun replaceLastFrames(frames: List<Bitmap>) {
+    private fun replaceLastFrames(frames: List<Bitmap>, timestampsMs: List<Long>) {
+        require(frames.size == timestampsMs.size) { "Для каждого кадра нужна отметка времени." }
         val previous = lastFrames
         lastFrames = frames
+        lastFrameTimestampsMs = timestampsMs
+        lastCaptureAtMs = System.currentTimeMillis()
         previous.filter { old -> frames.none { it === old } }.forEach(Bitmap::recycle)
     }
 
@@ -827,6 +845,7 @@ class OverlayCaptureService : Service() {
         worker.execute {
             lastFrames.forEach { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() }
             lastFrames = emptyList()
+            lastFrameTimestampsMs = emptyList()
         }
         worker.shutdown()
         super.onDestroy()
@@ -841,6 +860,7 @@ class OverlayCaptureService : Service() {
         val width: Int,
         val height: Int
     )
+    private data class ExtractedFrames(val bitmaps: List<Bitmap>, val timestampsMs: List<Long>)
 
     companion object {
         const val ACTION_START = "com.otcscanmaster.START"
@@ -863,9 +883,10 @@ class OverlayCaptureService : Service() {
         private const val NOTIFICATION_ID = 207
         private const val OVERLAY_HIDE_DELAY_MS = 450L
         private const val CAPTURE_TIMEOUT_MS = 4_000L
-        private const val VIDEO_DURATION_MS = 3_500L
-        private const val VIDEO_SAMPLE_INTERVAL_MS = 500L
-        private const val MAX_VIDEO_FRAMES = 8
+        private const val VIDEO_DURATION_MS = 10_000L
+        private const val VIDEO_SAMPLE_INTERVAL_MS = 1_000L
+        private const val MAX_VIDEO_FRAMES = 10
+        private const val MAX_SIGNAL_AGE_MS = 30_000L
         private const val MAX_ANALYSIS_DIMENSION = 1280
         private const val RESULT_OK = -1
     }

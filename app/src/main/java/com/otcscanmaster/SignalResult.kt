@@ -9,7 +9,11 @@ data class SignalResult(
     val expiration: String?,
     val analysis: String,
     val status: String,
-    val patterns: List<String> = emptyList()
+    val patterns: List<String> = emptyList(),
+    val priceMovement: String = "UNKNOWN",
+    val momentum: String = "STABLE",
+    val candleAnalysis: String = "Недостаточно данных",
+    val lowDataQuality: Boolean = false
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("pair", pair ?: JSONObject.NULL)
@@ -19,14 +23,23 @@ data class SignalResult(
         put("analysis", analysis)
         put("status", status)
         put("patterns", org.json.JSONArray(patterns))
+        put("priceMovement", priceMovement)
+        put("momentum", momentum)
+        put("candleAnalysis", candleAnalysis)
+        put("lowDataQuality", lowDataQuality)
     }
 
     fun displayText(): String = buildString {
         appendLine("OTC SCAN MASTER")
         pair?.let { appendLine("PAIR: $it") }
         appendLine("SIGNAL: $direction")
+        appendLine("DIRECTION: ${if (direction == "CALL") "UP" else if (direction == "PUT") "DOWN" else direction}")
         appendLine("CONFIDENCE: $confidence%")
+        appendLine("PRICE MOVEMENT: $priceMovement")
+        appendLine("MOMENTUM: $momentum")
+        appendLine("CANDLE ANALYSIS: $candleAnalysis")
         appendLine("STATUS: ${statusLabel(status)}")
+        if (lowDataQuality) appendLine("WARNING: LOW DATA QUALITY")
         expiration?.let { appendLine("EXPIRATION: $it") }
         if (patterns.isNotEmpty()) appendLine("PATTERNS: ${patterns.joinToString()}")
         append("ANALYSIS: $analysis")
@@ -62,7 +75,7 @@ data class SignalResult(
         fun fromJson(json: JSONObject): SignalResult {
             val requestedDirection = json.optString("direction", "WAIT").uppercase()
                 .takeIf { it in setOf("CALL", "PUT", "WAIT") } ?: "WAIT"
-            val status = json.optString("status", "success")
+            val parsedStatus = json.optString("status", "success")
                 .takeIf {
                     it in setOf(
                         STATUS_SUCCESS,
@@ -74,6 +87,11 @@ data class SignalResult(
                         STATUS_ANALYZING
                     )
                 } ?: STATUS_INSUFFICIENT_DATA
+            val status = if (parsedStatus == STATUS_SUCCESS && requestedDirection == "WAIT") {
+                STATUS_ANALYSIS_ERROR
+            } else {
+                parsedStatus
+            }
             val confidence = json.optInt("confidence", 0).coerceIn(0, 100)
             val isCompletedAnalysis = status == STATUS_SUCCESS
             val displayedDirection = if (isCompletedAnalysis) {
@@ -97,7 +115,11 @@ data class SignalResult(
                 status = status,
                 patterns = json.optJSONArray("patterns")?.let { array ->
                     (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }
-                } ?: emptyList()
+                } ?: emptyList(),
+                priceMovement = json.optString("priceMovement", "UNKNOWN"),
+                momentum = json.optString("momentum", "STABLE"),
+                candleAnalysis = json.optString("candleAnalysis", "Недостаточно данных"),
+                lowDataQuality = isCompletedAnalysis && json.optBoolean("lowDataQuality", false)
             )
         }
 
