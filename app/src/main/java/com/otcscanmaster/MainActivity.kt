@@ -35,8 +35,8 @@ class MainActivity : Activity() {
                 try {
                     resultView.text = SignalResult.fromJson(org.json.JSONObject(json)).displayText() +
                         "\n\nСигналы не гарантируют результат торговли."
-                } catch (_: Exception) {
-                    resultView.text = status
+                } catch (exception: Exception) {
+                    resultView.text = "Ошибка чтения результата: ${exception.message ?: "некорректные данные"}"
                 }
             }
         }
@@ -56,6 +56,21 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         updatePermissionStatuses()
+        restoreLatestState()
+    }
+
+    private fun restoreLatestState() {
+        if (!::serviceStatusView.isInitialized || !::resultView.isInitialized) return
+        val state = getSharedPreferences(OverlayCaptureService.PREFERENCES, MODE_PRIVATE)
+        serviceStatusView.text = state.getString(OverlayCaptureService.KEY_STATUS, serviceStatusView.text.toString())
+        state.getString(OverlayCaptureService.KEY_RESULT, null)?.let { json ->
+            try {
+                resultView.text = SignalResult.fromJson(org.json.JSONObject(json)).displayText() +
+                    "\n\nСигналы не гарантируют результат торговли."
+            } catch (exception: Exception) {
+                resultView.text = "Ошибка чтения сохранённого результата: ${exception.message ?: "некорректные данные"}"
+            }
+        }
     }
 
     @SuppressLint("UnspecifiedRegisterReceiverFlag")

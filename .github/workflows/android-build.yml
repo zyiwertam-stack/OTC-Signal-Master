@@ -1,0 +1,71 @@
+name: Android build
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  assemble-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK and run lint
+        run: ./gradlew --no-daemon :app:assembleDebug :app:lintDebug
+
+      - name: Calculate APK size and SHA-256
+        id: apk
+        run: |
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$apk"
+          size_bytes="$(stat -c '%s' "$apk")"
+          size_mib="$(awk -v bytes="$size_bytes" 'BEGIN { printf "%.2f", bytes / 1048576 }')"
+          sha256="$(sha256sum "$apk" | cut -d ' ' -f 1)"
+          echo "size_bytes=$size_bytes" >> "$GITHUB_OUTPUT"
+          echo "size_mib=$size_mib" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Debug APK"
+            echo "- File: \`app-debug.apk\`"
+            echo "- Size: ${size_mib} MiB (${size_bytes} bytes)"
+            echo "- SHA-256: \`${sha256}\`"
+            echo "- Download: see the \`otc-scan-master-debug-${GITHUB_RUN_NUMBER}\` artifact below."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: otc-scan-master-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14

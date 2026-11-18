@@ -22,6 +22,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -50,6 +51,8 @@ class OverlayCaptureService : Service() {
     private var mediaRecorder: MediaRecorder? = null
     private var recordingFile: File? = null
     @Volatile private var recordingActive = false
+    @Volatile private var analysisActive = false
+    @Volatile private var destroyed = false
     private val recorderLock = Any()
     private var displayListener: DisplayManager.DisplayListener? = null
     private var foregroundStarted = false
@@ -57,7 +60,7 @@ class OverlayCaptureService : Service() {
     private var screenHeight = 0
     private var densityDpi = 0
     @Volatile private var captureMode = CaptureMode.IDLE
-    private var lastFrames: List<Bitmap> = emptyList()
+    @Volatile private var lastFrames: List<Bitmap> = emptyList()
 
     override fun onCreate() {
         super.onCreate()
@@ -78,7 +81,9 @@ class OverlayCaptureService : Service() {
                 else -> showOverlay()
             }
         } catch (exception: Exception) {
-            publishStatus("Ошибка: ${exception.message ?: "не удалось запустить службу"}")
+            captureMode = CaptureMode.IDLE
+            setOverlayVisible(true)
+            publishTechnicalError("Ошибка службы: ${exception.message ?: "не удалось запустить службу"}")
         }
         return START_NOT_STICKY
     }
@@ -123,7 +128,7 @@ class OverlayCaptureService : Service() {
         } catch (exception: Exception) {
             projection?.stop()
             releaseProjection()
-            publishStatus("Не удалось начать захват: ${exception.message ?: "ошибка Android"}")
+            publishTechnicalError("Не удалось начать захват: ${exception.message ?: "ошибка Android"}")
         }
     }
 
@@ -148,6 +153,7 @@ class OverlayCaptureService : Service() {
         screenWidth = max(1, metrics.widthPixels)
         screenHeight = max(1, metrics.heightPixels)
         densityDpi = metrics.densityDpi
+        Log.i(TAG, "createVirtualDisplay size=${screenWidth}x$screenHeight densityDpi=$densityDpi")
         imageReader = createImageReader(screenWidth, screenHeight)
         virtualDisplay = projection?.createVirtualDisplay(
             "OTCScanMasterCapture",
@@ -198,11 +204,18 @@ class OverlayCaptureService : Service() {
             return
         }
         val image = reader.acquireLatestImage() ?: return
+        if (mode == CaptureMode.SCREENSHOT) captureMode = CaptureMode.IDLE
+        Log.d(TAG, "ImageReader frame size=${image.width}x${image.height} mode=$mode")
         worker.execute {
             val bitmap = try {
                 reduceForAnalysis(imageToBitmap(image))
             } catch (exception: Exception) {
-                publishStatus("Не удалось обработать кадр: ${exception.message ?: "ошибка изображения"}")
+                Log.e(TAG, "failed to convert ImageReader frame", exception)
+                if (mode == CaptureMode.SCREENSHOT) {
+                    captureMode = CaptureMode.IDLE
+                    setOverlayVisible(true)
+                }
+                publishTechnicalError("Не удалось обработать кадр: ${exception.message ?: "ошибка изображения"}")
                 null
             } finally {
                 image.close()
@@ -223,6 +236,10 @@ class OverlayCaptureService : Service() {
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
         val rowPixels = rowStride / pixelStride
+        Log.d(
+            TAG,
+            "convert frame size=${image.width}x${image.height} rowStride=$rowStride pixelStride=$pixelStride"
+        )
         val padded = Bitmap.createBitmap(rowPixels, image.height, Bitmap.Config.ARGB_8888)
         buffer.rewind()
         padded.copyPixelsFromBuffer(buffer)
@@ -253,19 +270,24 @@ class OverlayCaptureService : Service() {
 
     private fun takeScreenshot() {
         if (!ensureProjection()) return
-        if (captureMode != CaptureMode.IDLE || recordingActive) {
+        if (captureMode != CaptureMode.IDLE || recordingActive || analysisActive) {
             showMessage("Дождитесь завершения текущего захвата.")
             return
         }
         setOverlayVisible(false)
         publishStatus("Создание скриншота…")
         mainHandler.postDelayed({
+            if (destroyed) return@postDelayed
             captureMode = CaptureMode.SCREENSHOT
+            Log.i(TAG, "screenshot capture armed after overlay hide delay")
             mainHandler.postDelayed({
+                if (destroyed) return@postDelayed
                 if (captureMode == CaptureMode.SCREENSHOT) {
                     captureMode = CaptureMode.IDLE
                     setOverlayVisible(true)
-                    publishStatus("Не удалось получить кадр. Проверьте разрешение захвата.")
+                    publishTechnicalError(
+                        "Не удалось получить кадр от ImageReader за отведённое время. Проверьте разрешение захвата."
+                    )
                 }
             }, CAPTURE_TIMEOUT_MS)
         }, OVERLAY_HIDE_DELAY_MS)
@@ -275,29 +297,36 @@ class OverlayCaptureService : Service() {
         captureMode = CaptureMode.IDLE
         replaceLastFrames(listOf(bitmap))
         mainHandler.post { setOverlayVisible(true) }
-        publishStatus("Скриншот создан; анализирую на устройстве…")
-        analyzeFrames(listOf(bitmap))
+        Log.i(TAG, "screenshot received size=${bitmap.width}x${bitmap.height}; overlay restoration requested")
+        publishStatus("Скриншот ${bitmap.width}x${bitmap.height} получен; анализирую на устройстве…")
+        runAnalysis(listOf(bitmap))
     }
 
     private fun scanVideo() {
         if (!ensureProjection()) return
-        if (captureMode != CaptureMode.IDLE || recordingActive) {
+        if (captureMode != CaptureMode.IDLE || recordingActive || analysisActive) {
             showMessage("Дождитесь завершения текущего захвата.")
             return
         }
         setOverlayVisible(false)
         publishStatus("Подготовка короткого сканирования…")
         mainHandler.postDelayed({
+            if (destroyed) return@postDelayed
             worker.execute {
                 var preparedFile: File? = null
                 var preparedRecorder: MediaRecorder? = null
                 try {
                     val prepared = prepareVideoRecorder()
-                    preparedFile = prepared.first
-                    preparedRecorder = prepared.second
-                    val recorder = prepared.second
-                    val outputFile = prepared.first
+                    preparedFile = prepared.file
+                    preparedRecorder = prepared.recorder
+                    val recorder = prepared.recorder
+                    val outputFile = prepared.file
                     mainHandler.post {
+                        if (destroyed) {
+                            releaseRecorder(recorder)
+                            outputFile.delete()
+                            return@post
+                        }
                         try {
                             if (projection == null || virtualDisplay == null) {
                                 throw IllegalStateException("Сеанс захвата завершён.")
@@ -308,8 +337,14 @@ class OverlayCaptureService : Service() {
                             mediaRecorder = recorder
                             recordingActive = true
                             captureMode = CaptureMode.VIDEO
+                            Log.i(
+                                TAG,
+                                "video recording started size=${prepared.width}x${prepared.height} " +
+                                    "durationMs=$VIDEO_DURATION_MS"
+                            )
                             publishStatus("Запись экрана (3,5 секунды)…")
                             mainHandler.postDelayed({
+                                if (destroyed) return@postDelayed
                                 captureMode = CaptureMode.IDLE
                                 finishVideoRecording()
                             }, VIDEO_DURATION_MS)
@@ -318,23 +353,24 @@ class OverlayCaptureService : Service() {
                             outputFile.delete()
                             virtualDisplay?.surface = imageReader?.surface
                             setOverlayVisible(true)
-                            publishStatus("Не удалось начать запись: ${exception.message ?: "ошибка MediaRecorder"}")
+                            publishTechnicalError("Не удалось начать запись: ${exception.message ?: "ошибка MediaRecorder"}")
                         }
                     }
                 } catch (exception: Exception) {
                     preparedRecorder?.let(::releaseRecorder)
                     preparedFile?.delete()
                     mainHandler.post {
+                        if (destroyed) return@post
                         virtualDisplay?.surface = imageReader?.surface
                         setOverlayVisible(true)
-                        publishStatus("Не удалось подготовить запись: ${exception.message ?: "ошибка MediaRecorder"}")
+                        publishTechnicalError("Не удалось подготовить запись: ${exception.message ?: "ошибка MediaRecorder"}")
                     }
                 }
             }
         }, OVERLAY_HIDE_DELAY_MS)
     }
 
-    private fun prepareVideoRecorder(): Pair<File, MediaRecorder> {
+    private fun prepareVideoRecorder(): PreparedRecording {
         val scale = minOf(1f, MAX_ANALYSIS_DIMENSION.toFloat() / max(screenWidth, screenHeight))
         val width = ((screenWidth * scale).toInt() / 2) * 2
         val height = ((screenHeight * scale).toInt() / 2) * 2
@@ -350,7 +386,7 @@ class OverlayCaptureService : Service() {
             recorder.setVideoEncodingBitRate(3_000_000)
             recorder.setOutputFile(file.absolutePath)
             recorder.prepare()
-            return file to recorder
+            return PreparedRecording(file, recorder, width, height)
         } catch (exception: Exception) {
             releaseRecorder(recorder)
             file.delete()
@@ -361,7 +397,7 @@ class OverlayCaptureService : Service() {
     private fun finishVideoRecording() {
         val recorder = mediaRecorder ?: run {
             setOverlayVisible(true)
-            publishStatus("Запись экрана не была запущена.")
+            publishTechnicalError("Запись экрана не была запущена.")
             return
         }
         val file = recordingFile
@@ -387,20 +423,21 @@ class OverlayCaptureService : Service() {
             }
             if (recordingError != null || file == null || !file.isFile || file.length() == 0L) {
                 file?.delete()
-                publishStatus("Запись завершилась без пригодного видео. Повторите сканирование.")
+                publishTechnicalError("Запись завершилась без пригодного видео. Повторите сканирование.")
                 return@execute
             }
             try {
                 val frames = extractVideoFrames(file)
                 if (frames.isEmpty()) {
-                    publishStatus("Не удалось извлечь кадры из видеозаписи.")
+                    publishTechnicalError("Не удалось извлечь кадры из видеозаписи.")
                 } else {
                     replaceLastFrames(frames)
+                    Log.i(TAG, "video extracted frames=${frames.size} first=${frames.first().width}x${frames.first().height}")
                     publishStatus("Извлечено ${frames.size} последовательных кадров; анализирую на устройстве…")
-                    analyzeFrames(frames)
+                    runAnalysis(frames)
                 }
             } catch (exception: Exception) {
-                publishStatus("Ошибка обработки видео: ${exception.message ?: "не удалось извлечь кадры"}")
+                publishTechnicalError("Ошибка обработки видео: ${exception.message ?: "не удалось извлечь кадры"}")
             } finally {
                 file.delete()
             }
@@ -423,6 +460,7 @@ class OverlayCaptureService : Service() {
                     MediaMetadataRetriever.OPTION_CLOSEST
                 ) ?: continue
                 frames.add(reduceForAnalysis(frame))
+                Log.d(TAG, "video sample index=${frames.lastIndex + 1} timestampMs=${timestampUs / 1_000}")
             }
         } catch (exception: Exception) {
             frames.forEach(Bitmap::recycle)
@@ -443,12 +481,18 @@ class OverlayCaptureService : Service() {
     }
 
     private fun analyzeLastCapture() {
-        val frames = lastFrames
-        if (frames.isEmpty()) {
-            publishResult(SignalResult.insufficient("Сначала создайте скриншот или выполните VIDEO SCAN."))
+        if (analysisActive) {
+            showMessage("Анализ уже выполняется.")
             return
         }
-        analyzeFrames(frames)
+        worker.execute {
+            val frames = lastFrames
+            if (frames.isEmpty()) {
+                publishResult(SignalResult.insufficient("Сначала создайте скриншот или выполните VIDEO SCAN."))
+            } else {
+                runAnalysis(frames)
+            }
+        }
     }
 
     private fun analyzeImageUri(intent: Intent) {
@@ -478,22 +522,34 @@ class OverlayCaptureService : Service() {
                         ?: throw IllegalArgumentException("Файл не является читаемым изображением.")
                 }
                 replaceLastFrames(listOf(bitmap))
-                analyzeFrames(listOf(bitmap))
+                runAnalysis(listOf(bitmap))
             } catch (exception: Exception) {
-                publishStatus("Ошибка изображения: ${exception.message ?: "не удалось открыть файл"}")
+                publishResult(
+                    SignalResult.technicalFailure(
+                        SignalResult.STATUS_ANALYSIS_ERROR,
+                        "Ошибка изображения: ${exception.message ?: "не удалось открыть файл"}"
+                    )
+                )
             }
         }
     }
 
-    private fun analyzeFrames(frames: List<Bitmap>) {
-        publishStatus("Локальный анализ ${frames.size} кадр(ов)…")
-        worker.execute {
-            try {
-                val result = OnDeviceAnalysisEngine().analyze(frames)
-                publishResult(result)
-            } catch (exception: Exception) {
-                publishStatus("Ошибка локального анализа: ${exception.message ?: "не удалось обработать кадр"}")
-            }
+    private fun runAnalysis(frames: List<Bitmap>) {
+        analysisActive = true
+        publishStatus("${SignalResult.STATUS_ANALYZING.uppercase()}: локальный анализ ${frames.size} кадр(ов)…")
+        try {
+            val result = OnDeviceAnalysisEngine().analyze(frames)
+            publishResult(result)
+        } catch (exception: Exception) {
+            Log.e(TAG, "local analysis failed frames=${frames.size}", exception)
+            publishResult(
+                SignalResult.technicalFailure(
+                    SignalResult.STATUS_ANALYSIS_ERROR,
+                    "Локальный анализ не выполнен: ${exception.message ?: "не удалось обработать кадр"}"
+                )
+            )
+        } finally {
+            analysisActive = false
         }
     }
 
@@ -505,7 +561,7 @@ class OverlayCaptureService : Service() {
 
     private fun ensureProjection(): Boolean {
         if (projection != null && imageReader != null) return true
-        publishStatus("Разрешите системный захват экрана в приложении и повторите попытку.")
+        publishTechnicalError("Разрешите системный захват экрана в приложении и повторите попытку.")
         return false
     }
 
@@ -601,7 +657,7 @@ class OverlayCaptureService : Service() {
             text = "Готово"
             setTextColor(0xFFB7C4CC.toInt())
             textSize = 10f
-            maxLines = 2
+            maxLines = 4
             setPadding(dp(3), dp(5), dp(3), 0)
         }
         root.addView(statusView)
@@ -706,16 +762,28 @@ class OverlayCaptureService : Service() {
 
     private fun publishStatus(message: String) {
         statusView?.post { statusView?.text = message }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_STATUS, message).apply()
         sendBroadcast(Intent(ACTION_EVENT).setPackage(packageName).putExtra(EXTRA_STATUS, message))
     }
 
     private fun publishResult(result: SignalResult) {
-        publishStatus("Анализ завершён: ${result.direction} (${result.confidence}%)")
+        val resultText = result.displayText()
+        statusView?.post { statusView?.text = resultText }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+            .putString(KEY_STATUS, resultText)
+            .putString(KEY_RESULT, result.toJson().toString())
+            .apply()
+        Log.i(TAG, "result status=${result.status} direction=${result.direction} confidence=${result.confidence}")
         sendBroadcast(
             Intent(ACTION_EVENT).setPackage(packageName)
-                .putExtra(EXTRA_STATUS, result.displayText())
+                .putExtra(EXTRA_STATUS, resultText)
                 .putExtra(EXTRA_RESULT, result.toJson().toString())
         )
+    }
+
+    private fun publishTechnicalError(message: String) {
+        Log.e(TAG, message)
+        publishResult(SignalResult.technicalFailure(SignalResult.STATUS_CAPTURE_ERROR, message))
     }
 
     private fun showMessage(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
@@ -749,21 +817,30 @@ class OverlayCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         captureMode = CaptureMode.IDLE
-        lastFrames.forEach(Bitmap::recycle)
-        lastFrames = emptyList()
         val activeProjection = projection
         releaseProjection()
         activeProjection?.stop()
         overlay?.let { windowManager.removeView(it) }
         overlay = null
-        worker.shutdownNow()
+        worker.execute {
+            lastFrames.forEach { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() }
+            lastFrames = emptyList()
+        }
+        worker.shutdown()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private enum class CaptureMode { IDLE, SCREENSHOT, VIDEO }
+    private data class PreparedRecording(
+        val file: File,
+        val recorder: MediaRecorder,
+        val width: Int,
+        val height: Int
+    )
 
     companion object {
         const val ACTION_START = "com.otcscanmaster.START"
@@ -779,6 +856,10 @@ class OverlayCaptureService : Service() {
         const val EXTRA_STATUS = "status"
         const val EXTRA_RESULT = "result"
         private const val CHANNEL_ID = "scanner"
+        private const val TAG = "OTCScanCapture"
+        const val PREFERENCES = "scanner_state"
+        const val KEY_STATUS = "latest_status"
+        const val KEY_RESULT = "latest_result"
         private const val NOTIFICATION_ID = 207
         private const val OVERLAY_HIDE_DELAY_MS = 450L
         private const val CAPTURE_TIMEOUT_MS = 4_000L
